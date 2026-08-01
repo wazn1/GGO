@@ -1,13 +1,28 @@
 export default {
-  // تحديث المنتجات مباشرة عند فتح رابط الـ Worker أو تجربة الطلب
+  // 1. الاستجابة للطلب اليدوي + استقبال Webhook إضافة المنتجات الجديدة من سلة
   async fetch(request, env, ctx) {
+    if (request.method === "POST") {
+      try {
+        const body = await request.json();
+        
+        // عند إضافة منتج جديد في سلة تلقائياً
+        if (body.event === "product.created" && body.data) {
+          await updateSingleProduct(body.data, env);
+          return new Response(JSON.stringify({ success: true, message: "New product updated" }), { status: 200 });
+        }
+      } catch (e) {
+        console.error("Webhook Error:", e);
+      }
+    }
+
+    // إذا تم فتح الرابط بالمتصفح يدوياً للتجربة
     const result = await updateAllSallaProducts(env);
     return new Response(JSON.stringify(result, null, 2), {
       headers: { "content-type": "application/json;charset=UTF-8" }
     });
   },
 
-  // التحديث المجدول كل 5 دقائق
+  // 2. التشغيل التلقائي المجدول (Cron Trigger) بدون دخول الصفحة
   async scheduled(event, env, ctx) {
     await updateAllSallaProducts(env);
   }
@@ -36,17 +51,44 @@ async function getLiveGoldPrice() {
   }
 }
 
-// تحديث المنتجات في سلة
+// تحديث منتج منفرد فور إضافته
+async function updateSingleProduct(product, env) {
+  const prices = await getLiveGoldPrice();
+  if (!prices || !env.SALLA_ACCESS_TOKEN) return;
+
+  const makingFees = { 24: 0, 21: 25, 18: 35 };
+  const weight = parseFloat(product.weight) || 1;
+
+  let karat = 21;
+  if (product.name.includes("24") || product.name.includes("٢٤")) karat = 24;
+  else if (product.name.includes("18") || product.name.includes("١٨")) karat = 18;
+
+  let basePrice = prices.gram21;
+  if (karat === 24) basePrice = prices.gram24;
+  if (karat === 18) basePrice = prices.gram18;
+
+  const makingFee = makingFees[karat] || 0;
+  const newPrice = Number(((basePrice + makingFee) * weight).toFixed(2));
+
+  await fetch(`https://api.salla.dev/admin/v2/products/${product.id}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${env.SALLA_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify({ price: newPrice })
+  });
+}
+
+// تحديث جميع المنتجات
 async function updateAllSallaProducts(env) {
   const prices = await getLiveGoldPrice();
   if (!prices) return { success: false, message: "فشل جلب سعر الذهب" };
 
   const sallaToken = env.SALLA_ACCESS_TOKEN;
-  if (!sallaToken) {
-    return { success: false, message: "SALLA_ACCESS_TOKEN غير معرف في Settings" };
-  }
+  if (!sallaToken) return { success: false, message: "SALLA_ACCESS_TOKEN غير معرف" };
 
-  // المصنعية للجرام
   const makingFees = { 24: 0, 21: 25, 18: 35 };
   const updateLogs = [];
 
@@ -59,17 +101,11 @@ async function updateAllSallaProducts(env) {
     });
 
     const resData = await response.json();
-    if (!resData.success || !resData.data) {
-      return { success: false, sallaResponse: resData };
-    }
+    if (!resData.success || !resData.data) return { success: false, sallaResponse: resData };
 
-    const products = resData.data;
+    for (const product of resData.data) {
+      const weight = parseFloat(product.weight) || 1;
 
-    for (const product of products) {
-      // قراءة الوزن (إذا كان 0 يُحسب 1 جرام افتراضياً للتجربة)
-      const weight = parseFloat(product.weight) || 1; 
-
-      // فحص اسم المنتج لمعرفة العيار تلقائياً
       let karat = 21;
       if (product.name.includes("24") || product.name.includes("٢٤")) karat = 24;
       else if (product.name.includes("18") || product.name.includes("١٨")) karat = 18;
@@ -81,7 +117,6 @@ async function updateAllSallaProducts(env) {
       const makingFee = makingFees[karat] || 0;
       const newPrice = Number(((basePrice + makingFee) * weight).toFixed(2));
 
-      // إرسال تحديث السعر إلى سلة
       const updateRes = await fetch(`https://api.salla.dev/admin/v2/products/${product.id}`, {
         method: 'PUT',
         headers: {
@@ -102,7 +137,6 @@ async function updateAllSallaProducts(env) {
     }
 
     return { success: true, prices, updates: updateLogs };
-
   } catch (err) {
     return { success: false, error: err.message };
   }
