@@ -1,5 +1,5 @@
 export default {
-  // 1. عند فتح رابط الـ Worker مباشرة في المتصفح (عرض الأسعار الحالية)
+  // 1. الاستجابة عند فتح الرابط المباشر
   async fetch(request, env, ctx) {
     const prices = await getLiveGoldPrice();
     return new Response(JSON.stringify(prices, null, 2), {
@@ -7,13 +7,13 @@ export default {
     });
   },
 
-  // 2. التشغيل التلقائي عبر Cron Trigger (تحديث متجر سلة)
+  // 2. التشغيل التلقائي عبر Cron Trigger (تحديث كل المنتجات)
   async scheduled(event, env, ctx) {
-    await updateSallaPrices(env);
+    await updateAllSallaProducts(env);
   }
 };
 
-// دالة جلب سعر الذهب المباشر للجرام الصافي (بالريال السعودي)
+// دالة جلب سعر الذهب المباشر للجرام
 async function getLiveGoldPrice() {
   try {
     const response = await fetch("https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d", {
@@ -36,84 +36,71 @@ async function getLiveGoldPrice() {
   }
 }
 
-// دالة حساب السعر النهائي للقطعة شامل المصنعية
-function calculateItemPrice(gramPrice, makingFeePerGram, weightInGrams) {
-  const totalPrice = (gramPrice + makingFeePerGram) * weightInGrams;
-  return Number(totalPrice.toFixed(2));
-}
-
-// دالة تحديث أسعار المنتجات في سلة
-async function updateSallaPrices(env) {
+// دالة جلب كل المنتجات من متجر سلة وتحديثها تلقائياً
+async function updateAllSallaProducts(env) {
   const prices = await getLiveGoldPrice();
   if (!prices) return;
 
   const sallaToken = env.SALLA_ACCESS_TOKEN;
   if (!sallaToken) {
-    console.error("SALLA_ACCESS_TOKEN غير معرف في Settings");
+    console.error("SALLA_ACCESS_TOKEN غير موجود في Settings");
     return;
   }
 
-  // ⚙️ [1] إعداد قيمة المصنعية للجرام لكل عيار (بالريال):
+  // ⚙️ تحديد المصنعية للجرام لكل عيار
   const makingFees = {
-    karat24: 0,  // مصنعية عيار 24 للجرام (مثلاً: سبائك)
-    karat21: 25, // مصنعية عيار 21 للجرام
-    karat18: 35  // مصنعية عيار 18 للجرام
+    24: 0,   // مصنعية عيار 24
+    21: 25,  // مصنعية عيار 21
+    18: 35   // مصنعية عيار 18
   };
 
-  // 📦 [2] قائمة المنتجات المراد تحديثها في متجرك:
-  // (ضع معرف المنتج في سلة PRODUCT_ID، والوزن بالجرام، والعيار)
-  const productsToUpdate = [
-    {
-      id: "123456789", // معرف المنتج في سلة (Product ID)
-      weight: 5.5,     // وزن قطعة الذهب بالجرام
-      karat: 21        // العيار (18، 21، 24)
-    },
-    {
-      id: "987654321", // منتج آخر
-      weight: 3.2,
-      karat: 18
-    }
-  ];
-
-  // 🔄 [3] التكرار على المنتجات وتحديث أسعارها في سلة
-  for (const item of productsToUpdate) {
-    let baseGramPrice = 0;
-    let makingFee = 0;
-
-    if (item.karat === 24) {
-      baseGramPrice = prices.gram24;
-      makingFee = makingFees.karat24;
-    } else if (item.karat === 21) {
-      baseGramPrice = prices.gram21;
-      makingFee = makingFees.karat21;
-    } else if (item.karat === 18) {
-      baseGramPrice = prices.gram18;
-      makingFee = makingFees.karat18;
-    }
-
-    const finalPrice = calculateItemPrice(baseGramPrice, makingFee, item.weight);
-
-    try {
-      const response = await fetch(`https://api.salla.dev/admin/v2/products/${item.id}`, {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${sallaToken}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-          price: finalPrice
-        })
-      });
-
-      const result = await response.json();
-      if (result.success) {
-        console.log(`تم تحديث المنتج (${item.id}) بالسعر الجديد: ${finalPrice} ريال`);
-      } else {
-        console.error(`فشل تحديث المنتج (${item.id}):`, result);
+  try {
+    // 1. سحب جميع المنتجات تلقائياً من سلة
+    const response = await fetch("https://api.salla.dev/admin/v2/products?per_page=100", {
+      headers: {
+        "Authorization": `Bearer ${sallaToken}`,
+        "Accept": "application/json"
       }
-    } catch (err) {
-      console.error(`خطأ أثناء الاتصال بـ Salla API للمنتج (${item.id}):`, err);
+    });
+
+    const resData = await response.json();
+    if (!resData.success || !resData.data) {
+      console.error("فشل سحب المنتجات من سلة:", resData);
+      return;
     }
+
+    const products = resData.data;
+
+    // 2. التكرار على كل منتج مسحوب وتحديث سعره
+    for (const product of products) {
+      // قراءة الوزن والعيار من بيانات المنتج
+      // (يفضل تأكيد حقول الوزن والعيار المعتمدة في متجرك)
+      const weight = parseFloat(product.weight) || 0; 
+      const karat = parseInt(product.metadata?.karat || 21); // افتراضي عيار 21
+
+      if (weight > 0) {
+        let basePrice = prices.gram21;
+        if (karat === 24) basePrice = prices.gram24;
+        if (karat === 18) basePrice = prices.gram18;
+
+        const makingFee = makingFees[karat] || 0;
+        const newPrice = Number(((basePrice + makingFee) * weight).toFixed(2));
+
+        // إرسال التحديث لـ Salla API
+        await fetch(`https://api.salla.dev/admin/v2/products/${product.id}`, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${sallaToken}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({ price: newPrice })
+        });
+
+        console.log(`تم تحديث المنتج تلقائياً: ${product.name} بسعر ${newPrice} ريال`);
+      }
+    }
+  } catch (err) {
+    console.error("خطأ أثناء الاتصال بـ Salla API:", err);
   }
 }
